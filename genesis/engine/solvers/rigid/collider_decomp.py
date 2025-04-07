@@ -101,7 +101,7 @@ class Collider:
                 if not ((geoms_contype[i] & geoms_conaffinity[j]) or (geoms_contype[j] & geoms_conaffinity[i])):
                     continue
 
-                # pair of fixed base links
+                # pair of fixed links wrt the world
                 if links_is_fixed[i_la] and links_is_fixed[i_lb]:
                     continue
 
@@ -178,7 +178,11 @@ class Collider:
 
         ##---------------- box box
         if self._solver._box_box_detection:
-            self.box_MAXCONPAIR = 32
+            # With the existing Box-Box collision detection algorithm, it is not clear where the contact points are
+            # located depending of the pose and size of each box. In practice, up to 11 contact points have been
+            # observed. The theoretical worst case scenario would be 2 cubes roughly the same size and same center,
+            # with transform RPY = (45, 45, 45), resulting in 3 contact points per faces for a total of 16 points.
+            self.box_MAXCONPAIR = 16
             self.box_depth = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.box_MAXCONPAIR))
             self.box_points = ti.field(gs.ti_vec3, shape=self._solver._batch_shape(self.box_MAXCONPAIR))
             self.box_pts = ti.field(gs.ti_vec3, shape=self._solver._batch_shape(6))
@@ -207,9 +211,10 @@ class Collider:
             b = envs_idx[i_b_]
             self.first_time[b] = 1
             for i in range(self._solver.n_geoms):
-                self.contact_cache.i_va_0[i, i, b] = -1
-                self.contact_cache.penetration[i, i, b] = 0
-                self.contact_cache.normal[i, i, b] = 0
+                for j in range(self._solver.n_geoms):
+                    self.contact_cache.i_va_0[i, j, b] = -1
+                    self.contact_cache.penetration[i, j, b] = 0
+                    self.contact_cache.normal[i, j, b] = 0
 
     def clear(self, envs_idx=None):
         if envs_idx is None:
@@ -649,7 +654,7 @@ class Collider:
         ):
             is_valid = False
 
-        # pair of fixed links
+        # pair of fixed links wrt the world
         if self._solver.links_info[I_la].is_fixed and self._solver.links_info[I_lb].is_fixed:
             is_valid = False
 
@@ -869,7 +874,7 @@ class Collider:
     @ti.kernel
     def _func_narrow_phase(self):
         """
-        NOTE: for a single non-batched scene with a lot of collisioin pairs, it will be faster if we also parallelize over `self.n_collision_pairs`. However, parallelize over both B and collisioin_pairs (instead of only over B) leads to significantly slow performance for batched scene. We can treat B=0 and B>0 separately, but we will end up with messier code.
+        NOTE: for a single non-batched scene with a lot of collisioin pairs, it will be faster if we also parallelize over `self.n_collision_pairs`. However, parallelize over both B and collision_pairs (instead of only over B) leads to significantly slow performance for batched scene. We can treat B=0 and B>0 separately, but we will end up with messier code.
         Therefore, for a big non-batched scene, users are encouraged to simply use `gs.cpu` backend.
         Updated NOTE & TODO: For a HUGE scene with numerous bodies, it's also reasonable to run on GPU. Let's save this for later.
         Update2: Now we use n_broad_pairs instead of n_collision_pairs, so we probably need to think about how to handle non-batched large scene better.
@@ -987,8 +992,18 @@ class Collider:
                                                 break
 
                                         if valid:
-                                            n_valid += 1
-                                            self._func_add_contact(i_ga, i_gb, normal, contact_pos, penetration_0, i_b)
+                                            # Apply first-order penetration depth correction: compensate effect of small rotation
+                                            res = contact_pos - contact_pos_0
+                                            axis_dist = ti.sqrt(res.dot(res) - res.dot(axis) ** 2)
+                                            penetration = ti.min(
+                                                penetration_0, penetration - 2 * self._mc_perturbation * axis_dist
+                                            )
+
+                                            if penetration > 0.0:
+                                                self._func_add_contact(
+                                                    i_ga, i_gb, normal, contact_pos, penetration, i_b
+                                                )
+                                                n_valid += 1
 
                                     self._solver.geoms_state[i_ga, i_b].pos = ga_pos
                                     self._solver.geoms_state[i_ga, i_b].quat = ga_quat
@@ -1052,7 +1067,6 @@ class Collider:
                         contact_pos = pos_neighbor - normal * penetration * 0.5
 
                         if (contact_pos - contact_pos_0).norm() > tolerance:
-
                             self._func_add_contact(i_ga, i_gb, normal, contact_pos, penetration, i_b)
                             n_con = n_con + 1
 
@@ -1108,11 +1122,11 @@ class Collider:
         i_lb = self._solver.geoms_info[i_gb].link_idx
         I_la = [i_la, i_b] if ti.static(self._solver._options.batch_links_info) else i_la
         I_lb = [i_lb, i_b] if ti.static(self._solver._options.batch_links_info) else i_lb
-        is_self_pair = self._solver.links_info.root_idx[I_la] == self._solver.links_info.root_idx[I_lb]
         multi_contact = (
             self._solver.geoms_info[i_ga].type != gs.GEOM_TYPE.SPHERE
+            and self._solver.geoms_info[i_ga].type != gs.GEOM_TYPE.ELLIPSOID
             and self._solver.geoms_info[i_gb].type != gs.GEOM_TYPE.SPHERE
-            and not is_self_pair
+            and self._solver.geoms_info[i_gb].type != gs.GEOM_TYPE.ELLIPSOID
         )
         if is_plane:
             self._func_plane_contact(i_ga, i_gb, multi_contact, i_b)
@@ -1174,8 +1188,14 @@ class Collider:
                             if (contact_pos - prev_contact).norm() < tolerance:
                                 repeat = True
                     if not repeat:
-                        self._func_add_contact(i_ga, i_gb, normal, contact_pos, penetration_0, i_b)
-                        n_con = n_con + 1
+                        # Apply first-order penetration depth correction: revert effect of small rotation
+                        res = contact_pos - contact_pos_0
+                        axis_dist = ti.sqrt(res.dot(res) - res.dot(axis) ** 2)
+                        penetration = ti.min(penetration_0, penetration - 2 * self._mc_perturbation * axis_dist)
+
+                        if penetration > 0.0:
+                            self._func_add_contact(i_ga, i_gb, normal, contact_pos, penetration, i_b)
+                            n_con = n_con + 1
 
                     self._solver.geoms_state[i_ga, i_b].pos = ga_pos
                     self._solver.geoms_state[i_ga, i_b].quat = ga_quat
@@ -1196,7 +1216,7 @@ class Collider:
     @ti.func
     def _func_box_box_contact(self, i_ga: ti.i32, i_gb: ti.i32, i_b: ti.i32):
         """
-        Use Mujoco's box-box contact detection algorithm for more stable collision detction.
+        Use Mujoco's box-box contact detection algorithm for more stable collision detection.
 
         The compilation and running time of this function is longer than the MPR-based contact detection.
 
@@ -1239,7 +1259,7 @@ class Collider:
         rottabs = ti.abs(rott)
 
         plen2 = rotabs @ size2
-        plen1 = rottabs.transpose() @ size1
+        plen1 = rotabs.transpose() @ size1
         penetration = margin
         for i in range(3):
             penetration = penetration + size1[i] * 3 + size2[i] * 3
@@ -1296,20 +1316,13 @@ class Collider:
                         penetration = c3
                         cle1 = 0
                         for k in range(3):
-                            if k != i:
-                                if (tmp2[k] > 0) != (c2 < 0):
-                                    cle1 = cle1 + 1 << k
+                            if (k != i) and ((tmp2[k] > 0) ^ (c2 < 0)):
+                                cle1 = cle1 + (1 << k)
 
                         cle2 = 0
                         for k in range(3):
-                            if k != j:
-                                val = rot[i, 3 - k - j]
-                                cond1 = val > 0
-                                cond2 = c2 < 0
-                                cond3 = ((k - j + 3) % 3) == 1
-                                xor_all = (cond1 != cond2) != cond3
-                                if xor_all:
-                                    cle2 = cle2 + 1 << k
+                            if (k != j) and (rot[i, 3 - k - j] > 0) ^ (c2 < 0) ^ (((k - j + 3) % 3) == 1):
+                                cle2 = cle2 + (1 << k)
 
                         code = 12 + i * 3 + j
                         clnorm = tmp2
@@ -1684,7 +1697,6 @@ class Collider:
                                                 (self.box_linesu[i, i_b][2] + self.box_linesu[i, i_b][5] * c1) * innorm
                                                 <= margin
                                             ):
-
                                                 self.box_points[n, i_b] = (
                                                     self.box_linesu[i, i_b][0:3] * 0.5
                                                     + c1 * 0.5 * self.box_linesu[i, i_b][3:6]
@@ -1717,9 +1729,8 @@ class Collider:
                             if nl == 0:
                                 if (u < 0 or u > 1) and (v < 0 or v > 1):
                                     continue
-                            else:
-                                if u < 0 or u > 1 or v < 0 or v > 1:
-                                    continue
+                            elif u < 0 or u > 1 or v < 0 or v > 1:
+                                continue
 
                             u = ti.math.clamp(u, 0, 1)
                             v = ti.math.clamp(v, 0, 1)
@@ -1730,13 +1741,13 @@ class Collider:
 
                             tmp2 = self.box_points[n, i_b] - tmp1
 
-                            c1 = tmp2.dot(tmp2)
-                            if not (tmp1[2] > 0 and c1 > margin2):
+                            c2 = tmp2.dot(tmp2)
 
+                            if not (tmp1[2] > 0 and c2 > margin2):
                                 self.box_points[n, i_b] = self.box_points[n, i_b] + tmp1
                                 self.box_points[n, i_b] = self.box_points[n, i_b] * 0.5
 
-                                self.box_depth[n, i_b] = ti.sqrt(c1) * (-1 if tmp1[2] < 0 else 1)
+                                self.box_depth[n, i_b] = ti.sqrt(c2) * (-1 if tmp1[2] < 0 else 1)
                                 n = n + 1
 
                     nf = n
@@ -1746,11 +1757,10 @@ class Collider:
                             x, y = self.box_ppts2[i, 0, i_b], self.box_ppts2[i, 1, i_b]
 
                             if nl == 0:
-                                if (not (nf == 0)) and (x < -lx or x > lx) and (y < -ly or y > ly):
+                                if (nf != 0) and (x < -lx or x > lx) and (y < -ly or y > ly):
                                     continue
-                            else:
-                                if x < -lx or x > lx or y < -ly or y > ly:
-                                    continue
+                            elif x < -lx or x > lx or y < -ly or y > ly:
+                                continue
 
                             c1 = 0
                             for j in range(2):
@@ -1759,7 +1769,7 @@ class Collider:
                                 elif self.box_ppts2[i, j, i_b] > s[j]:
                                     c1 = c1 + (self.box_ppts2[i, j, i_b] - s[j]) ** 2
 
-                            c1 = c1 + self.box_pu[i, i_b][2] * self.box_pu[i, i_b][2] * innorm * innorm
+                            c1 = c1 + (self.box_pu[i, i_b][2] * innorm) ** 2
 
                             if self.box_pu[i, i_b][2] > 0 and c1 > margin2:
                                 continue
@@ -1795,13 +1805,14 @@ class Collider:
             for i in range(n):
                 self.box_valid[i, i_b] = True
 
+            # remove duplicates
             for i in range(n - 1):
                 for j in range(i + 1, n):
                     col_i = self.n_contacts[i_b] - n + i
                     col_j = self.n_contacts[i_b] - n + j
                     pos_i = self.contact_data[col_i, i_b].pos
                     pos_j = self.contact_data[col_j, i_b].pos
-                    if pos_i[0] == pos_j[0] and pos_i[1] == pos_j[1] and pos_i[2] == pos_j[2]:
+                    if (ti.abs(pos_i - pos_j) < gs.EPS).all():
                         self.box_valid[i, i_b] = False
                         break
             i = 0
@@ -1814,7 +1825,5 @@ class Collider:
 
                         self.contact_data[col_i, i_b].pos = self.contact_data[col_j, i_b].pos
                         self.contact_data[col_i, i_b].penetration = self.contact_data[col_j, i_b].penetration
-                    if i_ga == 20:
-                        col_i = self.n_contacts[i_b] - n + i
                     i = i + 1
             self.n_contacts[i_b] = self.n_contacts[i_b] - n + i

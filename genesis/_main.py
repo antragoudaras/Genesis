@@ -2,6 +2,7 @@ import argparse
 import multiprocessing
 import os
 import threading
+from itertools import chain
 import tkinter as tk
 from tkinter import ttk
 
@@ -78,18 +79,7 @@ class JointControlGUI:
 def get_movable_dofs(robot):
     motor_dofs = []
     motor_dof_names = []
-
-    if gs.platform == "macOS":
-        # Flatten the nested list structure for macOS
-        all_joints = []
-        for joint_list in robot.joints:
-            for joint in joint_list:
-                all_joints.append(joint)
-        joints_to_process = all_joints
-    else:
-        joints_to_process = robot.joints
-
-    for joint in joints_to_process:
+    for joint in chain.from_iterable(robot.joints):
         if joint.type == gs.JOINT_TYPE.FREE:
             continue
         elif joint.type == gs.JOINT_TYPE.FIXED:
@@ -154,80 +144,28 @@ def view(filename, collision, rotate, scale=1.0, show_link_frame=False):
     motor_dofs, motor_names = get_movable_dofs(entity)
     dof_pos_limits = torch.stack(entity.get_dofs_limit(motor_dofs), dim=1).numpy()
 
-    if gs.platform == "Linux":
-        # Shared positions list between GUI and simulation
-        gui_joint_positions = np.zeros(len(motor_dofs))
+    manager = multiprocessing.Manager()
+    gui_joint_positions = manager.list([0.0] * len(motor_dofs))
+    stop_event = multiprocessing.Event()
+    # Start the GUI process
+    gui_process = multiprocessing.Process(
+        target=_start_gui_mac, args=(motor_names, dof_pos_limits, gui_joint_positions, stop_event), daemon=True
+    )
+    gui_process.start()
 
-        # Start GUI in a separate thread
-        stop_event = threading.Event()
-        is_gui_closed = [False]
+    t = 0
+    while scene.viewer.is_alive() and not stop_event.is_set():
+        # rotate entity
+        t += dt
+        if rotate:
+            entity.set_quat(gs.utils.geom.xyz_to_quat(np.array([0, 0, t * 50]), rpy=True, degrees=True))
 
-        def on_close():
-            is_gui_closed[0] = True
-            stop_event.set()
-
-        def start_gui():
-            root = tk.Tk()
-            app = JointControlGUI(root, motor_names, dof_pos_limits, gui_joint_positions)
-            root.protocol("WM_DELETE_WINDOW", on_close)
-            root.mainloop()
-
-        if len(motor_names) > 0:
-            gui_thread = threading.Thread(target=start_gui, daemon=True)
-            gui_thread.start()
-
-        t = 0
-        while scene.viewer.is_alive() and not is_gui_closed[0]:
-            # rotate entity
-            t += dt
-            if rotate:
-                entity.set_quat(gs.utils.geom.xyz_to_quat(np.array([0, 0, t * 50])))
-
-            entity.set_dofs_position(
-                position=torch.tensor(gui_joint_positions),
-                dofs_idx_local=motor_dofs,
-                zero_velocity=True,
-            )
-            scene.visualizer.update(force=True)
-
-    elif gs.platform == "macOS":
-        manager = multiprocessing.Manager()
-        gui_joint_positions = manager.list([0.0] * len(motor_dofs))
-        stop_event = multiprocessing.Event()
-        # Start the GUI process
-        gui_process = multiprocessing.Process(
-            target=_start_gui_mac, args=(motor_names, dof_pos_limits, gui_joint_positions, stop_event), daemon=True
+        entity.set_dofs_position(
+            position=torch.tensor(gui_joint_positions),
+            dofs_idx_local=motor_dofs,
+            zero_velocity=True,
         )
-        gui_process.start()
-
-        def update_scene(gui_joint_positions, motor_dofs, rotate, entity, dt, stop_event):
-            t = 0
-            while not stop_event.is_set():
-                # rotate entity
-                t += dt
-                if rotate:
-                    entity.set_quat(gs.utils.geom.xyz_to_quat(np.array([0, 0, t * 50])))
-
-                entity.set_dofs_position(
-                    position=torch.tensor(gui_joint_positions),
-                    dofs_idx_local=motor_dofs,
-                    zero_velocity=True,
-                )
-
-        gs.tools.run_in_another_thread(
-            fn=update_scene, args=(gui_joint_positions, motor_dofs, rotate, entity, dt, stop_event)
-        )
-
-        # Main thread handles the viewer updates
-        while scene.viewer.is_alive() and not stop_event.is_set():
-            scene.visualizer.update(force=True)
-
-        # Clean up when viewer is closed
-        stop_event.set()
-        gui_process.terminate()
-
-    else:
-        raise NotImplementedError(f"Platform {gs.platform} is not supported.")
+        scene.visualizer.update(force=True)
 
 
 def animate(filename_pattern, fps):

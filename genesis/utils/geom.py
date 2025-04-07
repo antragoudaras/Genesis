@@ -10,15 +10,21 @@ import genesis as gs
 
 
 @ti.func
-def ti_transform_quat_by_quat(v, u):
-    # This method transforms quat_v by quat_u
-    # This is equivalent to quatmul(quat_u, quat_v) or R_u @ R_v
+def ti_quat_mul(u, v):
     terms = v.outer_product(u)
     w = terms[0, 0] - terms[1, 1] - terms[2, 2] - terms[3, 3]
     x = terms[0, 1] + terms[1, 0] - terms[2, 3] + terms[3, 2]
     y = terms[0, 2] + terms[1, 3] + terms[2, 0] - terms[3, 1]
     z = terms[0, 3] - terms[1, 2] + terms[2, 1] + terms[3, 0]
-    return ti.Vector([w, x, y, z]).normalized()
+    return ti.Vector([w, x, y, z])
+
+
+@ti.func
+def ti_transform_quat_by_quat(v, u):
+    # This method transforms quat_v by quat_u
+    # This is equivalent to quatmul(quat_u, quat_v) or R_u @ R_v
+    vec = ti_quat_mul(u, v)
+    return vec.normalized()
 
 
 @ti.func
@@ -343,6 +349,18 @@ def get_face_norm(v0, v1, v2):
     return face_norm
 
 
+@ti.func
+def ti_quat_mul_axis(q, axis):
+    return ti.Vector(
+        [
+            -q[1] * axis[0] - q[2] * axis[1] - q[3] * axis[2],
+            q[0] * axis[0] + q[2] * axis[2] - q[3] * axis[1],
+            q[0] * axis[1] + q[3] * axis[0] - q[1] * axis[2],
+            q[0] * axis[2] + q[1] * axis[1] - q[2] * axis[0],
+        ]
+    )
+
+
 # ------------------------------------------------------------------------------------
 # -------------------------------- torch and numpy -----------------------------------
 # ------------------------------------------------------------------------------------
@@ -551,6 +569,33 @@ def trans_quat_to_T(trans, quat):
         )
 
 
+def T_to_trans_quat(T):
+    if isinstance(T, torch.Tensor):
+        if T.ndim == 2:
+            trans = T[:3, 3]
+            quat = R_to_quat(T[:3, :3])
+        elif T.ndim == 3:
+            trans = T[:, :3, 3]
+            quat = R_to_quat(T[:, :3, :3])
+        else:
+            gs.raise_exception(f"ndim expected to be 2 or 3, but got {T.ndim=}")
+        return trans, quat
+    elif isinstance(T, np.ndarray):
+        if T.ndim == 2:
+            trans = T[:3, 3]
+            quat = Rotation.from_matrix(T[:3, :3]).as_quat()
+            quat = xyzw_to_wxyz(quat)
+        elif T.ndim == 3:
+            trans = T[:, :3, 3]
+            quat = Rotation.from_matrix(T[:, :3, :3]).as_quat()
+            quat = xyzw_to_wxyz(quat)
+        else:
+            gs.raise_exception(f"ndim expected to be 2 or 3, but got {T.ndim=}")
+        return trans, quat
+    else:
+        raise TypeError(f"Input must be a torch.Tensor or np.ndarray. Got: {type(T)}")
+
+
 def trans_R_to_T(trans, R):
     if isinstance(trans, torch.Tensor) and isinstance(R, torch.Tensor):
         T = torch.eye(4, dtype=R.dtype, device=R.device)
@@ -632,7 +677,7 @@ def quat_to_T(quat):
         gs.raise_exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
 
 
-def quat_to_xyz(quat, rpy=True, degrees=True):
+def quat_to_xyz(quat, rpy=False, degrees=False):
     if isinstance(quat, torch.Tensor):
         # Extract quaternion components
         qw, qx, qy, qz = quat.unbind(-1)
@@ -677,7 +722,7 @@ def quat_to_xyz(quat, rpy=True, degrees=True):
         gs.raise_exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
 
 
-def xyz_to_quat(euler_xyz, rpy=True, degrees=True):
+def xyz_to_quat(euler_xyz, rpy=False, degrees=False):
     if isinstance(euler_xyz, torch.Tensor):
         if degrees:
             euler_xyz *= torch.pi / 180.0

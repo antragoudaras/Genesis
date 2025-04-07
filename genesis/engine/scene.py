@@ -343,6 +343,17 @@ class Scene(RBC):
         else:
             gs.raise_exception()
 
+        # Rigid entities will convexify geom by default
+        if hasattr(morph, "convexify") and morph.convexify is None:
+            if isinstance(material, (gs.materials.Rigid, gs.materials.Avatar)):
+                morph.convexify = True
+            else:
+                morph.convexify = False
+
+        # Decimate if convexify by default
+        if hasattr(morph, "decimate") and morph.decimate is None:
+            morph.decimate = morph.convexify
+
         entity = self._sim._add_entity(morph, material, surface, visualize_contact)
 
         return entity
@@ -469,9 +480,9 @@ class Scene(RBC):
         GUI : bool
             Whether to display the camera's rendered image in a separate GUI window.
         spp : int, optional
-            Samples per pixel. Defaults to 256.
+            Samples per pixel. Only available when using RayTracer renderer. Defaults to 256.
         denoise : bool
-            Whether to denoise the camera's rendered image.
+            Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer.. Defaults to True. If OptiX denoiser is not available in your platform, consider enabling the OIDN denoiser option when building the RayTracer.
 
         Returns
         -------

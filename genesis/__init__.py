@@ -1,10 +1,12 @@
 # import taichi while suppressing its output
 import os
 import sys
+import site
 import ctypes
 import atexit
 import logging as _logging
 import traceback
+from platform import system
 from unittest.mock import patch
 
 _ti_outputs = []
@@ -18,7 +20,12 @@ def fake_print(*args, **kwargs):
 with patch("builtins.print", fake_print):
     import taichi as ti
 
-import torch
+try:
+    import torch
+except ImportError as e:
+    raise ImportError(
+        "'torch' module not available. Please install pytorch manually: https://pytorch.org/get-started/locally/"
+    ) from e
 import numpy as np
 
 from .constants import GS_ARCH, TI_ARCH
@@ -31,6 +38,52 @@ _initialized = False
 backend = None
 exit_callbacks = []
 global_scene_list = set()
+
+
+############ fix python DLL search dir for OMPL ############
+try:
+    import ompl
+
+    _is_ompl_available = True
+except ImportError:
+    _is_ompl_available = False
+
+
+def dll_loader(lib, path):
+    # First, try the user-specified path
+    sys = system()
+    if sys == "Windows":
+        ext = ".dll"
+    elif sys == "Darwin":
+        ext = ".dylib"
+    else:  # Linux, other UNIX systems
+        ext = ".so"
+    fname = f"lib{lib}{ext}"
+    fpath = os.path.join(path, fname)
+
+    # Fallback to site-packages
+    if not os.path.isfile(fpath):
+        for sitepackagedir in site.getsitepackages():
+            if not os.path.exists(sitepackagedir):
+                continue
+            for _fname in os.listdir(sitepackagedir):
+                _fpath = os.path.join(sitepackagedir, _fname)
+                if os.path.isfile(_fpath):
+                    if _fname.startswith(fname):
+                        fpath = _fpath
+                        break
+
+    # Fallback to system loading and pray
+    if not os.path.isfile(fpath):
+        fpath = find_library(lib)
+
+    cdll = ctypes.CDLL(fpath, ctypes.RTLD_GLOBAL)
+    if cdll is None:
+        gs.raise_exception(f"Failed to load dynamic library '{lib}' (search path '{path}').")
+
+
+if _is_ompl_available:
+    ompl.dll_loader = dll_loader
 
 
 ########################## init ##########################
@@ -51,23 +104,10 @@ def init(
     _initialized = True
 
     # genesis._theme
-    if theme not in ["dark", "light", "dumb"]:
-        raise_exception(f"Unsupported theme: {theme}")
     global _theme
-    _theme = theme
-
-    # Dealing with default backend
-    global platform
-    platform = get_platform()
-    if backend is None:
-        if debug or platform == "macOS":
-            backend = gs_backend.cpu
-        else:
-            backend = gs_backend.gpu
-
-    # verbose repr
-    global _verbose
-    _verbose = False
+    is_theme_valid = theme in ("dark", "light", "dumb")
+    # Set fallback theme if necessary to be able to initialize logger
+    _theme = theme if is_theme_valid else "dark"
 
     # genesis.logger
     global logger
@@ -76,6 +116,23 @@ def init(
     logger = Logger(logging_level, logger_verbose_time)
     atexit.register(_gs_exit)
 
+    # Must delay raising exception after logger initialization
+    if not is_theme_valid:
+        raise_exception(f"Unsupported theme: {theme}")
+
+    # Dealing with default backend
+    global platform
+    platform = get_platform()
+    if backend is None:
+        if debug:
+            backend = gs_backend.cpu
+        else:
+            backend = gs_backend.gpu
+
+    # verbose repr
+    global _verbose
+    _verbose = False
+
     # greeting message
     _display_greeting(logger.INFO_length)
 
@@ -83,7 +140,7 @@ def init(
     if backend not in GS_ARCH[platform]:
         raise_exception(f"backend ~~<{backend}>~~ not supported for platform ~~<{platform}>~~")
     if backend == gs_backend.metal:
-        logger.warning("Beware Apple Metal backend is partially broken.")
+        logger.info("Beware Apple Metal backend may be unstable.")
 
     # get default device and compute total device memory
     global device
@@ -129,6 +186,8 @@ def init(
     ti_vec6 = ti.types.vector(6, ti_float)
     global ti_vec7
     ti_vec7 = ti.types.vector(7, ti_float)
+    global ti_vec11
+    ti_vec11 = ti.types.vector(11, ti_float)
     global ti_mat3
     ti_mat3 = ti.types.matrix(3, 3, ti_float)
     global ti_mat4
@@ -149,7 +208,7 @@ def init(
     elif gs.logger.level == _logging.ERROR:
         taichi_kwargs.update(log_level=ti.ERROR)
     elif gs.logger.level == _logging.WARNING:
-        taichi_kwargs.update(log_level=ti.WARNING)
+        taichi_kwargs.update(log_level=ti.WARN)
     elif gs.logger.level == _logging.INFO:
         taichi_kwargs.update(log_level=ti.INFO)
     elif gs.logger.level == _logging.DEBUG:
@@ -181,8 +240,9 @@ def init(
             debug=False,
             check_out_of_bound=debug,
             # force_scalarize_matrix=True for speeding up kernel compilation
-            force_scalarize_matrix=not debug,
-            # Turning off advanced optimization is causin issues on MacOS
+            # Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
+            force_scalarize_matrix=True,
+            # Turning off 'advanced_optimization' is causing issues on MacOS
             advanced_optimization=True,
             fast_math=not debug,
             default_ip=ti_int,
@@ -304,6 +364,8 @@ if sys.platform == "darwin":
     libc.fflush(None)
     libc.dup2(devnull.fileno(), stderr_fileno)
 
+from .ext import _trimesh_patch
+
 from .constants import (
     IntEnum,
     JOINT_TYPE,
@@ -334,6 +396,7 @@ from .engine import states, materials, force_fields
 from .engine.scene import Scene
 from .engine.mesh import Mesh
 from .engine.entities.emitter import Emitter
+
 
 if sys.platform == "darwin":
     sys.stderr.flush()
